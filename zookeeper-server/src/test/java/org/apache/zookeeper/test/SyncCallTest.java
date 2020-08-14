@@ -18,8 +18,8 @@
 
 package org.apache.zookeeper.test;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.IOException;
 import java.util.Date;
 import java.util.LinkedList;
@@ -36,7 +36,7 @@ import org.apache.zookeeper.DummyWatcher;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.Stat;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 public class SyncCallTest extends ClientBase implements ChildrenCallback, Children2Callback, StringCallback, VoidCallback, Create2Callback {
 
@@ -48,11 +48,11 @@ public class SyncCallTest extends ClientBase implements ChildrenCallback, Childr
     @Test
     public void testSync() throws Exception {
         try {
-            LOG.info("Starting ZK:" + (new Date()).toString());
+            LOG.info("Starting ZK:{}", (new Date()).toString());
             opsCount = new CountDownLatch(limit);
             ZooKeeper zk = createClient();
 
-            LOG.info("Beginning test:" + (new Date()).toString());
+            LOG.info("Beginning test:{}", (new Date()).toString());
             for (int i = 0; i < 50; i++) {
                 zk.create("/test" + i, new byte[0], Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT, (StringCallback) this, results);
             }
@@ -70,7 +70,7 @@ public class SyncCallTest extends ClientBase implements ChildrenCallback, Childr
             for (int i = 0; i < 100; i++) {
                 zk.getChildren("/", DummyWatcher.INSTANCE, (Children2Callback) this, results);
             }
-            LOG.info("Submitted all operations:" + (new Date()).toString());
+            LOG.info("Submitted all operations:{}", (new Date()).toString());
 
             if (!opsCount.await(10000, TimeUnit.MILLISECONDS)) {
                 fail("Haven't received all confirmations" + opsCount.getCount());

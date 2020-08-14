@@ -315,6 +315,16 @@ public class ZooKeeperServerBean implements ZooKeeperServerMXBean, ZKMBeanInfo {
     // Request throttling settings
     ///////////////////////////////////////////////////////////////////////////
 
+    public int getThrottledOpWaitTime() {
+        return ZooKeeperServer.getThrottledOpWaitTime();
+    }
+
+    public void setThrottledOpWaitTime(int val) {
+        ZooKeeperServer.setThrottledOpWaitTime(val);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+
     public int getRequestThrottleLimit() {
         return RequestThrottler.getMaxRequests();
     }
@@ -402,5 +412,9 @@ public class ZooKeeperServerBean implements ZooKeeperServerMXBean, ZKMBeanInfo {
 
     public void setLargeRequestThreshold(int threshold) {
         zks.setLargeRequestThreshold(threshold);
+    }
+
+    public int getMaxCnxns() {
+        return ServerCnxnHelper.getMaxCnxns(zks.secureServerCnxnFactory, zks.serverCnxnFactory);
     }
 }

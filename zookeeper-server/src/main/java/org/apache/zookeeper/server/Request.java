@@ -27,7 +27,10 @@ import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.metrics.Summary;
 import org.apache.zookeeper.metrics.SummarySet;
+import org.apache.zookeeper.server.quorum.LearnerHandler;
 import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
+import org.apache.zookeeper.server.util.AuthUtil;
+import org.apache.zookeeper.txn.TxnDigest;
 import org.apache.zookeeper.txn.TxnHeader;
 
 /**
@@ -98,11 +101,31 @@ public class Request {
 
     public long syncQueueStartTime;
 
+    public long requestThrottleQueueTime;
+
     private Object owner;
 
     private KeeperException e;
 
     public QuorumVerifier qv = null;
+
+    private TxnDigest txnDigest;
+
+    private boolean isThrottledFlag = false;
+
+    public boolean isThrottled() {
+      return isThrottledFlag;
+    }
+
+    public void setIsThrottled(boolean val) {
+      isThrottledFlag = val;
+    }
+
+    public boolean isThrottlable() {
+        return this.type != OpCode.ping
+                && this.type != OpCode.closeSession
+                && this.type != OpCode.createSession;
+    }
 
     /**
      * If this is a create or close request for a local-only session.
@@ -243,9 +266,11 @@ public class Request {
         case OpCode.setACL:
         case OpCode.setData:
         case OpCode.setWatches:
+        case OpCode.setWatches2:
         case OpCode.sync:
         case OpCode.checkWatches:
         case OpCode.removeWatches:
+        case OpCode.addWatch:
             return true;
         default:
             return false;
@@ -334,6 +359,8 @@ public class Request {
                 return "auth";
             case OpCode.setWatches:
                 return "setWatches";
+            case OpCode.setWatches2:
+                return "setWatches2";
             case OpCode.sasl:
                 return "sasl";
             case OpCode.getEphemerals:
@@ -364,6 +391,7 @@ public class Request {
         String path = "n/a";
         if (type != OpCode.createSession
             && type != OpCode.setWatches
+            && type != OpCode.setWatches2
             && type != OpCode.closeSession
             && request != null
             && request.remaining() >= 4) {
@@ -429,4 +457,42 @@ public class Request {
         logLatency(metric, key, Time.currentWallTime());
     }
 
+    /**
+     * Returns comma separated list of users authenticated in the current
+     * session
+     */
+    public String getUsers() {
+        if (authInfo == null) {
+            return (String) null;
+        }
+        if (authInfo.size() == 1) {
+            return AuthUtil.getUser(authInfo.get(0));
+        }
+        StringBuilder users = new StringBuilder();
+        boolean first = true;
+        for (Id id : authInfo) {
+            String user = AuthUtil.getUser(id);
+            if (user != null) {
+                if (first) {
+                    first = false;
+                } else {
+                    users.append(",");
+                }
+                users.append(user);
+            }
+        }
+        return users.toString();
+    }
+
+    public TxnDigest getTxnDigest() {
+        return txnDigest;
+    }
+
+    public void setTxnDigest(TxnDigest txnDigest) {
+        this.txnDigest = txnDigest;
+    }
+
+    public boolean isFromLearner() {
+        return owner instanceof LearnerHandler;
+    }
 }

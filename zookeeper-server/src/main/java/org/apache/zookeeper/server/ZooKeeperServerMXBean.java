@@ -136,6 +136,9 @@ public interface ZooKeeperServerMXBean {
     boolean getRequestThrottleDropStale();
     void setRequestThrottleDropStale(boolean drop);
 
+    int getThrottledOpWaitTime();
+    void setThrottledOpWaitTime(int val);
+
     boolean getRequestStaleLatencyCheck();
     void setRequestStaleLatencyCheck(boolean check);
 
@@ -220,5 +223,10 @@ public interface ZooKeeperServerMXBean {
 
     int getMaxBatchSize();
     void setMaxBatchSize(int size);
+
+    /**
+     * @return Current maxCnxns allowed to a single ZooKeeper server
+     */
+   int getMaxCnxns();
 
 }

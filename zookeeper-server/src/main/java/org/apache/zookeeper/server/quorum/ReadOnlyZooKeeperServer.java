@@ -19,6 +19,8 @@
 package org.apache.zookeeper.server.quorum;
 
 import java.io.PrintWriter;
+import java.util.Objects;
+import java.util.stream.Collectors;
 import org.apache.zookeeper.jmx.MBeanRegistry;
 import org.apache.zookeeper.server.DataTreeBean;
 import org.apache.zookeeper.server.FinalRequestProcessor;
@@ -50,7 +52,8 @@ public class ReadOnlyZooKeeperServer extends ZooKeeperServer {
             self.maxSessionTimeout,
             self.clientPortListenBacklog,
             zkDb,
-            self.getInitialConfig());
+            self.getInitialConfig(),
+            self.isReconfigEnabled());
         this.self = self;
     }
 
@@ -170,9 +173,11 @@ public class ReadOnlyZooKeeperServer extends ZooKeeperServer {
         pwriter.print("electionAlg=");
         pwriter.println(self.getElectionType());
         pwriter.print("electionPort=");
-        pwriter.println(self.getElectionAddress().getPort());
+        pwriter.println(self.getElectionAddress().getAllPorts()
+                .stream().map(Objects::toString).collect(Collectors.joining("|")));
         pwriter.print("quorumPort=");
-        pwriter.println(self.getQuorumAddress().getPort());
+        pwriter.println(self.getQuorumAddress().getAllPorts()
+                .stream().map(Objects::toString).collect(Collectors.joining("|")));
         pwriter.print("peerType=");
         pwriter.println(self.getLearnerType().ordinal());
     }

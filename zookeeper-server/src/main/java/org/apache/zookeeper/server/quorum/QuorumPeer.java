@@ -31,12 +31,13 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -45,6 +46,8 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import javax.security.sasl.SaslException;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.zookeeper.KeeperException.BadArgumentsException;
@@ -136,11 +139,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
     public static final class AddressTuple {
 
-        public final InetSocketAddress quorumAddr;
-        public final InetSocketAddress electionAddr;
+        public final MultipleAddresses quorumAddr;
+        public final MultipleAddresses electionAddr;
         public final InetSocketAddress clientAddr;
 
-        public AddressTuple(InetSocketAddress quorumAddr, InetSocketAddress electionAddr, InetSocketAddress clientAddr) {
+        public AddressTuple(MultipleAddresses quorumAddr, MultipleAddresses electionAddr, InetSocketAddress clientAddr) {
             this.quorumAddr = quorumAddr;
             this.electionAddr = electionAddr;
             this.clientAddr = clientAddr;
@@ -158,11 +161,49 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         this.observerMasterPort = observerMasterPort;
     }
 
+    public static final String CONFIG_KEY_MULTI_ADDRESS_ENABLED = "zookeeper.multiAddress.enabled";
+    public static final String CONFIG_DEFAULT_MULTI_ADDRESS_ENABLED = "false";
+
+    private boolean multiAddressEnabled = true;
+    public boolean isMultiAddressEnabled() {
+        return multiAddressEnabled;
+    }
+
+    public void setMultiAddressEnabled(boolean multiAddressEnabled) {
+        this.multiAddressEnabled = multiAddressEnabled;
+        LOG.info("multiAddress.enabled set to {}", multiAddressEnabled);
+    }
+
+    public static final String CONFIG_KEY_MULTI_ADDRESS_REACHABILITY_CHECK_TIMEOUT_MS = "zookeeper.multiAddress.reachabilityCheckTimeoutMs";
+
+    private int multiAddressReachabilityCheckTimeoutMs = (int) MultipleAddresses.DEFAULT_TIMEOUT.toMillis();
+    public int getMultiAddressReachabilityCheckTimeoutMs() {
+        return multiAddressReachabilityCheckTimeoutMs;
+    }
+
+    public void setMultiAddressReachabilityCheckTimeoutMs(int multiAddressReachabilityCheckTimeoutMs) {
+        this.multiAddressReachabilityCheckTimeoutMs = multiAddressReachabilityCheckTimeoutMs;
+        LOG.info("multiAddress.reachabilityCheckTimeoutMs set to {}", multiAddressReachabilityCheckTimeoutMs);
+    }
+
+    public static final String CONFIG_KEY_MULTI_ADDRESS_REACHABILITY_CHECK_ENABLED = "zookeeper.multiAddress.reachabilityCheckEnabled";
+
+    private boolean multiAddressReachabilityCheckEnabled = true;
+
+    public boolean isMultiAddressReachabilityCheckEnabled() {
+        return multiAddressReachabilityCheckEnabled;
+    }
+
+    public void setMultiAddressReachabilityCheckEnabled(boolean multiAddressReachabilityCheckEnabled) {
+        this.multiAddressReachabilityCheckEnabled = multiAddressReachabilityCheckEnabled;
+        LOG.info("multiAddress.reachabilityCheckEnabled set to {}", multiAddressReachabilityCheckEnabled);
+    }
+
     public static class QuorumServer {
 
-        public InetSocketAddress addr = null;
+        public MultipleAddresses addr = new MultipleAddresses();
 
-        public InetSocketAddress electionAddr = null;
+        public MultipleAddresses electionAddr = new MultipleAddresses();
 
         public InetSocketAddress clientAddr = null;
 
@@ -200,54 +241,41 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
          * unmodified.
          */
         public void recreateSocketAddresses() {
-            if (this.addr == null) {
+            if (this.addr.isEmpty()) {
                 LOG.warn("Server address has not been initialized");
                 return;
             }
-            if (this.electionAddr == null) {
+            if (this.electionAddr.isEmpty()) {
                 LOG.warn("Election address has not been initialized");
                 return;
             }
-            String host = this.addr.getHostString();
-            InetAddress address = null;
-            try {
-                address = InetAddress.getByName(host);
-            } catch (UnknownHostException ex) {
-                LOG.warn("Failed to resolve address: {}", host, ex);
-                return;
-            }
-            LOG.debug("Resolved address for {}: {}", host, address);
-            int port = this.addr.getPort();
-            this.addr = new InetSocketAddress(address, port);
-            port = this.electionAddr.getPort();
-            this.electionAddr = new InetSocketAddress(address, port);
+            this.addr.recreateSocketAddresses();
+            this.electionAddr.recreateSocketAddresses();
         }
 
-        private void setType(String s) throws ConfigException {
-            if (s.toLowerCase().equals("observer")) {
-                type = LearnerType.OBSERVER;
-            } else if (s.toLowerCase().equals("participant")) {
-                type = LearnerType.PARTICIPANT;
-            } else {
-                throw new ConfigException("Unrecognised peertype: " + s);
+        private LearnerType getType(String s) throws ConfigException {
+            switch (s.trim().toLowerCase()) {
+                case "observer":
+                    return LearnerType.OBSERVER;
+                case "participant":
+                    return LearnerType.PARTICIPANT;
+                default:
+                    throw new ConfigException("Unrecognised peertype: " + s);
             }
         }
 
         private static final String wrongFormat =
             " does not have the form server_config or server_config;client_config"
-            + " where server_config is host:port:port or host:port:port:type and client_config is port or host:port";
+            + " where server_config is the pipe separated list of host:port:port or host:port:port:type"
+            + " and client_config is port or host:port";
 
         public QuorumServer(long sid, String addressStr) throws ConfigException {
-            // LOG.warn("sid = " + sid + " addressStr = " + addressStr);
             this.id = sid;
+            LearnerType newType = null;
             String[] serverClientParts = addressStr.split(";");
-            String[] serverParts = ConfigUtils.getHostAndPort(serverClientParts[0]);
-            if ((serverClientParts.length > 2) || (serverParts.length < 3) || (serverParts.length > 4)) {
-                throw new ConfigException(addressStr + wrongFormat);
-            }
+            String[] serverAddresses = serverClientParts[0].split("\\|");
 
             if (serverClientParts.length == 2) {
-                //LOG.warn("ClientParts: " + serverClientParts[1]);
                 String[] clientParts = ConfigUtils.getHostAndPort(serverClientParts[1]);
                 if (clientParts.length > 2) {
                     throw new ConfigException(addressStr + wrongFormat);
@@ -257,35 +285,62 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                 hostname = (clientParts.length == 2) ? clientParts[0] : "0.0.0.0";
                 try {
                     clientAddr = new InetSocketAddress(hostname, Integer.parseInt(clientParts[clientParts.length - 1]));
-                    //LOG.warn("Set clientAddr to " + clientAddr);
                 } catch (NumberFormatException e) {
                     throw new ConfigException("Address unresolved: " + hostname + ":" + clientParts[clientParts.length - 1]);
                 }
             }
 
-            // server_config should be either host:port:port or host:port:port:type
-            try {
-                addr = new InetSocketAddress(serverParts[0], Integer.parseInt(serverParts[1]));
-            } catch (NumberFormatException e) {
-                throw new ConfigException("Address unresolved: " + serverParts[0] + ":" + serverParts[1]);
-            }
-            try {
-                electionAddr = new InetSocketAddress(serverParts[0], Integer.parseInt(serverParts[2]));
-            } catch (NumberFormatException e) {
-                throw new ConfigException("Address unresolved: " + serverParts[0] + ":" + serverParts[2]);
+            boolean multiAddressEnabled = Boolean.parseBoolean(
+                System.getProperty(QuorumPeer.CONFIG_KEY_MULTI_ADDRESS_ENABLED, QuorumPeer.CONFIG_DEFAULT_MULTI_ADDRESS_ENABLED));
+            if (!multiAddressEnabled && serverAddresses.length > 1) {
+                throw new ConfigException("Multiple address feature is disabled, but multiple addresses were specified for sid " + sid);
             }
 
-            if (addr.getPort() == electionAddr.getPort()) {
-                throw new ConfigException(
-                    "Client and election port must be different! Please update the configuration file on server."
-                    + sid);
+            for (String serverAddress : serverAddresses) {
+                String serverParts[] = ConfigUtils.getHostAndPort(serverAddress);
+                if ((serverClientParts.length > 2) || (serverParts.length < 3)
+                        || (serverParts.length > 4)) {
+                    throw new ConfigException(addressStr + wrongFormat);
+                }
+
+                // server_config should be either host:port:port or host:port:port:type
+                InetSocketAddress tempAddress;
+                InetSocketAddress tempElectionAddress;
+                try {
+                    tempAddress = new InetSocketAddress(serverParts[0], Integer.parseInt(serverParts[1]));
+                    addr.addAddress(tempAddress);
+                } catch (NumberFormatException e) {
+                    throw new ConfigException("Address unresolved: " + serverParts[0] + ":" + serverParts[1]);
+                }
+                try {
+                    tempElectionAddress = new InetSocketAddress(serverParts[0], Integer.parseInt(serverParts[2]));
+                    electionAddr.addAddress(tempElectionAddress);
+                } catch (NumberFormatException e) {
+                    throw new ConfigException("Address unresolved: " + serverParts[0] + ":" + serverParts[2]);
+                }
+
+                if (tempAddress.getPort() == tempElectionAddress.getPort()) {
+                    throw new ConfigException("Client and election port must be different! Please update the "
+                            + "configuration file on server." + sid);
+                }
+
+                if (serverParts.length == 4) {
+                    LearnerType tempType = getType(serverParts[3]);
+                    if (newType == null) {
+                        newType = tempType;
+                    }
+
+                    if (newType != tempType) {
+                        throw new ConfigException("Multiple addresses should have similar roles: " + type + " vs " + tempType);
+                    }
+                }
+
+                this.hostname = serverParts[0];
             }
 
-            if (serverParts.length == 4) {
-                setType(serverParts[3]);
+            if (newType != null) {
+                type = newType;
             }
-
-            this.hostname = serverParts[0];
 
             setMyAddrs();
         }
@@ -296,8 +351,12 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
         public QuorumServer(long id, InetSocketAddress addr, InetSocketAddress electionAddr, InetSocketAddress clientAddr, LearnerType type) {
             this.id = id;
-            this.addr = addr;
-            this.electionAddr = electionAddr;
+            if (addr != null) {
+                this.addr.addAddress(addr);
+            }
+            if (electionAddr != null) {
+                this.electionAddr.addAddress(electionAddr);
+            }
             this.type = type;
             this.clientAddr = clientAddr;
 
@@ -305,10 +364,10 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         }
 
         private void setMyAddrs() {
-            this.myAddrs = new ArrayList<InetSocketAddress>();
-            this.myAddrs.add(this.addr);
+            this.myAddrs = new ArrayList<>();
+            this.myAddrs.addAll(this.addr.getAllAddresses());
             this.myAddrs.add(this.clientAddr);
-            this.myAddrs.add(this.electionAddr);
+            this.myAddrs.addAll(this.electionAddr.getAllAddresses());
             this.myAddrs = excludedSpecialAddresses(this.myAddrs);
         }
 
@@ -323,27 +382,31 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
         public String toString() {
             StringWriter sw = new StringWriter();
-            //addr should never be null, but just to make sure
-            if (addr != null) {
-                sw.append(delimitedHostString(addr));
-                sw.append(":");
-                sw.append(String.valueOf(addr.getPort()));
+
+            List<InetSocketAddress> addrList = new LinkedList<>(addr.getAllAddresses());
+            List<InetSocketAddress> electionAddrList = new LinkedList<>(electionAddr.getAllAddresses());
+
+            if (addrList.size() > 0 && electionAddrList.size() > 0) {
+                addrList.sort(Comparator.comparing(InetSocketAddress::getHostString));
+                electionAddrList.sort(Comparator.comparing(InetSocketAddress::getHostString));
+                sw.append(IntStream.range(0, addrList.size()).mapToObj(i -> String.format("%s:%d:%d",
+                        delimitedHostString(addrList.get(i)), addrList.get(i).getPort(), electionAddrList.get(i).getPort()))
+                        .collect(Collectors.joining("|")));
             }
-            if (electionAddr != null) {
-                sw.append(":");
-                sw.append(String.valueOf(electionAddr.getPort()));
-            }
+
             if (type == LearnerType.OBSERVER) {
                 sw.append(":observer");
             } else if (type == LearnerType.PARTICIPANT) {
                 sw.append(":participant");
             }
+
             if (clientAddr != null && !isClientAddrFromStatic) {
                 sw.append(";");
                 sw.append(delimitedHostString(clientAddr));
                 sw.append(":");
                 sw.append(String.valueOf(clientAddr.getPort()));
             }
+
             return sw.toString();
         }
 
@@ -366,20 +429,19 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
             if ((qs.id != id) || (qs.type != type)) {
                 return false;
             }
-            if (!checkAddressesEqual(addr, qs.addr)) {
+            if (!addr.equals(qs.addr)) {
                 return false;
             }
-            if (!checkAddressesEqual(electionAddr, qs.electionAddr)) {
+            if (!electionAddr.equals(qs.electionAddr)) {
                 return false;
             }
             return checkAddressesEqual(clientAddr, qs.clientAddr);
         }
 
         public void checkAddressDuplicate(QuorumServer s) throws BadArgumentsException {
-            List<InetSocketAddress> otherAddrs = new ArrayList<InetSocketAddress>();
-            otherAddrs.add(s.addr);
+            List<InetSocketAddress> otherAddrs = new ArrayList<>(s.addr.getAllAddresses());
             otherAddrs.add(s.clientAddr);
-            otherAddrs.add(s.electionAddr);
+            otherAddrs.addAll(s.electionAddr.getAllAddresses());
             otherAddrs = excludedSpecialAddresses(otherAddrs);
 
             for (InetSocketAddress my : this.myAddrs) {
@@ -723,7 +785,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                 while (running) {
                     udpSocket.receive(packet);
                     if (packet.getLength() != 4) {
-                        LOG.warn("Got more than just an xid! Len = " + packet.getLength());
+                        LOG.warn("Got more than just an xid! Len = {}", packet.getLength());
                     } else {
                         responseBuffer.clear();
                         responseBuffer.getInt(); // Skip the xid
@@ -814,9 +876,9 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         return syncMode.get();
     }
 
-    public void setLeaderAddressAndId(InetSocketAddress addr, long newId) {
+    public void setLeaderAddressAndId(MultipleAddresses addr, long newId) {
         if (addr != null) {
-            leaderAddress.set(addr.getHostString());
+            leaderAddress.set(String.join("|", addr.getAllHostStrings()));
         } else {
             leaderAddress.set(null);
         }
@@ -908,11 +970,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         }
     }
 
-    public InetSocketAddress getQuorumAddress() {
+    public MultipleAddresses getQuorumAddress() {
         return getAddrs().quorumAddr;
     }
 
-    public InetSocketAddress getElectionAddress() {
+    public MultipleAddresses getElectionAddress() {
         return getAddrs().electionAddr;
     }
 
@@ -921,7 +983,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         return (addrs == null) ? null : addrs.clientAddr;
     }
 
-    private void setAddrs(InetSocketAddress quorumAddr, InetSocketAddress electionAddr, InetSocketAddress clientAddr) {
+    private void setAddrs(MultipleAddresses quorumAddr, MultipleAddresses electionAddr, InetSocketAddress clientAddr) {
         synchronized (QV_LOCK) {
             myAddrs.set(new AddressTuple(quorumAddr, electionAddr, clientAddr));
             QV_LOCK.notifyAll();
@@ -941,6 +1003,8 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
     AdminServer adminServer;
 
+    private final boolean reconfigEnabled;
+
     public static QuorumPeer testingQuorumPeer() throws SaslException {
         return new QuorumPeer();
     }
@@ -952,6 +1016,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         adminServer = AdminServerFactory.createAdminServer();
         x509Util = createX509Util();
         initialize();
+        reconfigEnabled = QuorumPeerConfig.isReconfigEnabled();
     }
 
     // VisibleForTesting
@@ -1037,7 +1102,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                 // this should only happen once when moving to a
                 // new code version
                 currentEpoch = epochOfZxid;
-                LOG.info(CURRENT_EPOCH_FILENAME + " not found! Creating with a reasonable default of {}. This should only happen when you are upgrading your installation", currentEpoch);
+                LOG.info(
+                    "{} not found! Creating with a reasonable default of {}. "
+                        + "This should only happen when you are upgrading your installation",
+                    CURRENT_EPOCH_FILENAME,
+                    currentEpoch);
                 writeLongToFile(CURRENT_EPOCH_FILENAME, currentEpoch);
             }
             if (epochOfZxid > currentEpoch) {
@@ -1053,7 +1122,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                 // this should only happen once when moving to a
                 // new code version
                 acceptedEpoch = epochOfZxid;
-                LOG.info(ACCEPTED_EPOCH_FILENAME + " not found! Creating with a reasonable default of {}. This should only happen when you are upgrading your installation", acceptedEpoch);
+                LOG.info(
+                    "{} not found! Creating with a reasonable default of {}. "
+                        + "This should only happen when you are upgrading your installation",
+                    ACCEPTED_EPOCH_FILENAME,
+                    acceptedEpoch);
                 writeLongToFile(ACCEPTED_EPOCH_FILENAME, acceptedEpoch);
             }
             if (acceptedEpoch < currentEpoch) {
@@ -1201,11 +1274,9 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         //TODO: use a factory rather than a switch
         switch (electionAlgorithm) {
         case 1:
-            le = new AuthFastLeaderElection(this);
-            break;
+            throw new UnsupportedOperationException("Election Algorithm 1 is not supported.");
         case 2:
-            le = new AuthFastLeaderElection(this, true);
-            break;
+            throw new UnsupportedOperationException("Election Algorithm 2 is not supported.");
         case 3:
             QuorumCnxManager qcm = createCnxnManager();
             QuorumCnxManager oldQcm = qcmRef.getAndSet(qcm);
@@ -1587,7 +1658,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
      * Set the number of milliseconds of each tick
      */
     public void setTickTime(int tickTime) {
-        LOG.info("tickTime set to " + tickTime);
+        LOG.info("tickTime set to {}", tickTime);
         this.tickTime = tickTime;
     }
 
@@ -1609,7 +1680,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
     /** Whether to enable local sessions */
     public void enableLocalSessions(boolean flag) {
-        LOG.info("Local sessions " + (flag ? "enabled" : "disabled"));
+        LOG.info("Local sessions {}", (flag ? "enabled" : "disabled"));
         localSessionsEnabled = flag;
     }
 
@@ -1620,7 +1691,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
     /** Whether to allow local sessions to upgrade to global sessions */
     public void enableLocalSessionsUpgrading(boolean flag) {
-        LOG.info("Local session upgrading " + (flag ? "enabled" : "disabled"));
+        LOG.info("Local session upgrading {}", (flag ? "enabled" : "disabled"));
         localSessionsUpgradingEnabled = flag;
     }
 
@@ -1631,7 +1702,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
     /** minimum session timeout in milliseconds */
     public void setMinSessionTimeout(int min) {
-        LOG.info("minSessionTimeout set to " + min);
+        LOG.info("minSessionTimeout set to {}", min);
         this.minSessionTimeout = min;
     }
 
@@ -1642,7 +1713,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
 
     /** maximum session timeout in milliseconds */
     public void setMaxSessionTimeout(int max) {
-        LOG.info("maxSessionTimeout set to " + max);
+        LOG.info("maxSessionTimeout set to {}", max);
         this.maxSessionTimeout = max;
     }
 
@@ -1667,7 +1738,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
      * Set the number of ticks that the initial synchronization phase can take
      */
     public void setInitLimit(int initLimit) {
-        LOG.info("initLimit set to " + initLimit);
+        LOG.info("initLimit set to {}", initLimit);
         this.initLimit = initLimit;
     }
 
@@ -1736,6 +1807,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
     }
 
     public void setLastSeenQuorumVerifier(QuorumVerifier qv, boolean writeToDisk) {
+        if (!isReconfigEnabled()) {
+            LOG.info("Dynamic reconfig is disabled, we don't store the last seen config.");
+            return;
+        }
+
         // If qcm is non-null, we may call qcm.connectOne(), which will take the lock on qcm
         // and then take QV_LOCK.  Take the locks in the same order to ensure that we don't
         // deadlock against other callers of connectOne().  If qcmRef gets set in another
@@ -1770,7 +1846,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                             QuorumPeerConfig.writeDynamicConfig(fileName, qv, true);
                         }
                     } catch (IOException e) {
-                        LOG.error("Error writing next dynamic config file to disk: ", e.getMessage());
+                        LOG.error("Error writing next dynamic config file to disk", e);
                     }
                 }
             }
@@ -1782,11 +1858,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
             if ((quorumVerifier != null) && (quorumVerifier.getVersion() >= qv.getVersion())) {
                 // this is normal. For example - server found out about new config through FastLeaderElection gossiping
                 // and then got the same config in UPTODATE message so its already known
-                LOG.debug("{} setQuorumVerifier called with known or old config {}."
-                          + " Current version: {}",
-                          getId(),
-                          qv.getVersion(),
-                          quorumVerifier.getVersion());
+                LOG.debug(
+                    "{} setQuorumVerifier called with known or old config {}. Current version: {}",
+                    getId(),
+                    qv.getVersion(),
+                    quorumVerifier.getVersion());
                 return quorumVerifier;
             }
             QuorumVerifier prevQV = quorumVerifier;
@@ -1803,7 +1879,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
                         QuorumPeerConfig.writeDynamicConfig(dynamicConfigFilename, qv, false);
                         QuorumPeerConfig.editStaticConfig(configFilename, dynamicConfigFilename, needEraseClientInfoFromStaticConfig());
                     } catch (IOException e) {
-                        LOG.error("Error closing file: ", e.getMessage());
+                        LOG.error("Error closing file", e);
                     }
                 } else {
                     LOG.info("writeToDisk == true but configFilename == null");
@@ -1849,7 +1925,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
      * Set the synclimit
      */
     public void setSyncLimit(int syncLimit) {
-        LOG.info("syncLimit set to " + syncLimit);
+        LOG.info("syncLimit set to {}", syncLimit);
         this.syncLimit = syncLimit;
     }
 
@@ -1864,7 +1940,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
      * Set the connectToLearnerMasterLimit
      */
     public void setConnectToLearnerMasterLimit(int connectToLearnerMasterLimit) {
-        LOG.info("connectToLearnerMasterLimit set to " + connectToLearnerMasterLimit);
+        LOG.info("connectToLearnerMasterLimit set to {}", connectToLearnerMasterLimit);
         this.connectToLearnerMasterLimit = connectToLearnerMasterLimit;
     }
 
@@ -1880,7 +1956,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
      */
     public boolean getSyncEnabled() {
         if (System.getProperty(SYNC_ENABLED) != null) {
-            LOG.info(SYNC_ENABLED + "=" + Boolean.getBoolean(SYNC_ENABLED));
+            LOG.info("{}={}", SYNC_ENABLED, Boolean.getBoolean(SYNC_ENABLED));
             return Boolean.getBoolean(SYNC_ENABLED);
         } else {
             return syncEnabled;
@@ -2048,7 +2124,8 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
      * @param value the long value to write to the named file
      * @throws IOException if the file cannot be written atomically
      */
-    private void writeLongToFile(String name, final long value) throws IOException {
+    // visibleForTest
+     void writeLongToFile(String name, final long value) throws IOException {
         File file = new File(logFactory.getSnapDir(), name);
         new AtomicFileWritingIdiom(file, new WriterStatement() {
             @Override
@@ -2073,18 +2150,18 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
     }
 
     public void setCurrentEpoch(long e) throws IOException {
-        currentEpoch = e;
         writeLongToFile(CURRENT_EPOCH_FILENAME, e);
+        currentEpoch = e;
 
     }
 
     public void setAcceptedEpoch(long e) throws IOException {
-        acceptedEpoch = e;
         writeLongToFile(ACCEPTED_EPOCH_FILENAME, e);
+        acceptedEpoch = e;
     }
 
     public boolean processReconfig(QuorumVerifier qv, Long suggestedLeaderId, Long zxid, boolean restartLE) {
-        if (!QuorumPeerConfig.isReconfigEnabled()) {
+        if (!isReconfigEnabled()) {
             LOG.debug("Reconfig feature is disabled, skip reconfig processing.");
             return false;
         }
@@ -2184,7 +2261,8 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         observerMasters.clear();
         StringBuilder sb = new StringBuilder();
         for (QuorumServer server : quorumVerifier.getVotingMembers().values()) {
-            InetSocketAddress addr = new InetSocketAddress(server.addr.getAddress(), observerMasterPort);
+            InetAddress address = server.addr.getReachableOrOne().getAddress();
+            InetSocketAddress addr = new InetSocketAddress(address, observerMasterPort);
             observerMasters.add(new QuorumServer(server.id, addr));
             sb.append(addr).append(",");
         }
@@ -2239,9 +2317,11 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
             }
             for (QuorumServer server : observerMasters) {
                 if (sid == null) {
-                    String serverAddr = server.addr.getAddress().getHostAddress() + ':' + server.addr.getPort();
-                    if (serverAddr.startsWith(desiredMaster)) {
-                        return server;
+                    for (InetSocketAddress address : server.addr.getAllAddresses()) {
+                        String serverAddr = address.getAddress().getHostAddress() + ':' + address.getPort();
+                        if (serverAddr.startsWith(desiredMaster)) {
+                            return server;
+                        }
                     }
                 } else {
                     if (sid.equals(server.id)) {
@@ -2296,7 +2376,7 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
         if (currentVote != null && designatedLeader != currentVote.getId()) {
             setCurrentVote(new Vote(designatedLeader, zxid));
             reconfigFlagSet();
-            LOG.warn("Suggested leader: " + designatedLeader);
+            LOG.warn("Suggested leader: {}", designatedLeader);
             return true;
         }
         return false;
@@ -2445,6 +2525,10 @@ public class QuorumPeer extends ZooKeeperThread implements QuorumStats.Provider 
     boolean isLeader(long id) {
         Vote vote = getCurrentVote();
         return vote != null && id == vote.getId();
+    }
+
+    public boolean isReconfigEnabled() {
+        return reconfigEnabled;
     }
 
     @InterfaceAudience.Private
